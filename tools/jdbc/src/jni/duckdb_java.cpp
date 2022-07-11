@@ -4,6 +4,7 @@
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/main/appender.hpp"
+#include "duckdb/common/result_arrow_wrapper.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 
 using namespace duckdb;
@@ -57,6 +58,9 @@ static jfieldID J_DuckVector_varlen;
 static jclass J_DuckArrayStreamWrapper;
 static jmethodID J_DuckArrayStreamWrapper_exportArrayStream;
 static jmethodID J_DuckArrayStreamWrapper_exportSchema;
+
+static jclass J_DuckArrayStreamImporter;
+static jmethodID J_DuckArrayStreamImporter_importArrayStream;
 
 static jclass J_ByteBuffer;
 
@@ -158,6 +162,13 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
 	    env->GetMethodID(J_DuckArrayStreamWrapper, "exportArrayStream", "(J)V");
 	J_DuckArrayStreamWrapper_exportSchema = env->GetMethodID(J_DuckArrayStreamWrapper, "exportSchema", "(J)V");
 
+	tmpLocalRef = env->FindClass("org/duckdb/DuckDBArrayStreamImporter");
+	J_DuckArrayStreamImporter = (jclass)env->NewGlobalRef(tmpLocalRef);
+	env->DeleteLocalRef(tmpLocalRef);
+
+	J_DuckArrayStreamImporter_importArrayStream =
+	    env->GetMethodID(J_DuckArrayStreamImporter, "importArrayStream", "(J)Ljava/lang/Object;");
+
 	return JNI_VERSION;
 }
 
@@ -183,6 +194,7 @@ JNIEXPORT void JNICALL JNI_OnUnload(JavaVM *vm, void *reserved) {
 	env->DeleteGlobalRef(J_DuckVector);
 	env->DeleteGlobalRef(J_ByteBuffer);
 	env->DeleteGlobalRef(J_DuckArrayStreamWrapper);
+	env->DeleteGlobalRef(J_DuckArrayStreamImporter);
 }
 
 static string byte_array_to_string(JNIEnv *env, jbyteArray ba_j) {
@@ -966,4 +978,21 @@ JNIEXPORT void JNICALL Java_org_duckdb_DuckDBNative_duckdb_1jdbc_1ingest_1arrow_
 		env->ThrowNew(J_SQLException, e.what());
 		return;
 	}
+}
+
+JNIEXPORT jobject JNICALL Java_org_duckdb_DuckDBNative_duckdb_1jdbc_1export_1arrow_1array_1stream(
+    JNIEnv *env, jclass, jobject res_ref_buf, jobject array_stream_exporter_j) {
+	auto res_ref = (ResultHolder *)env->GetDirectBufferAddress(res_ref_buf);
+	if (!res_ref || !res_ref->res || !res_ref->res->success) {
+		env->ThrowNew(J_SQLException, "Invalid result set");
+		return nullptr;
+	}
+
+	// TODO batch size
+	ResultArrowArrayStreamWrapper *result_stream = new ResultArrowArrayStreamWrapper(move(res_ref->res), 1024);
+
+	jobject arrow_reader = env->CallObjectMethod(array_stream_exporter_j, J_DuckArrayStreamImporter_importArrayStream,
+	                                             (long)&result_stream->stream);
+	// check for errors?
+	return arrow_reader;
 }

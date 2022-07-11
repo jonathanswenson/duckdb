@@ -39,19 +39,17 @@ public class DuckDBResultSet implements ResultSet {
 	private DuckDBResultSetMetaData meta;
 
 	private ByteBuffer result_ref;
-	private DuckDBVector[] current_chunk;
+	private DuckDBVector[] current_chunk = {};
 	private int chunk_idx = 0;
 	private boolean finished = false;
 	private boolean was_null;
+
+	private boolean pulled_first_chunk = false;
 
 	public DuckDBResultSet(DuckDBPreparedStatement stmt, DuckDBResultSetMetaData meta, ByteBuffer result_ref) throws SQLException {
 		this.stmt = stmt;
 		this.result_ref = result_ref;
 		this.meta = meta;
-		current_chunk = DuckDBNative.duckdb_jdbc_fetch(result_ref);
-		if (current_chunk.length == 0) {
-			finished = true;
-		}
 	}
 
 	public Statement getStatement() throws SQLException {
@@ -68,6 +66,17 @@ public class DuckDBResultSet implements ResultSet {
 		return meta;
 	}
 
+	public Object arrowExportArrayStream(DuckDBArrayStreamImporter importer) throws SQLException {
+		if (pulled_first_chunk) {
+			throw new SQLException("ResultSet was not at beginning");
+		}
+		// TODO prevent from doing this if we aren't at the beginning of the stream or something
+		Object arrowReader = DuckDBNative.duckdb_jdbc_export_arrow_array_stream(result_ref, importer);
+		// mark this finished, so we don't try to iterate through it again
+		finished = true;
+		return arrowReader;
+	}
+
 	public boolean next() throws SQLException {
 		if (isClosed()) {
 			throw new SQLException("ResultSet was closed");
@@ -76,7 +85,8 @@ public class DuckDBResultSet implements ResultSet {
 			return false;
 		}
 		chunk_idx++;
-		if (chunk_idx > current_chunk[0].length) {
+		if (current_chunk.length == 0 || chunk_idx > current_chunk[0].length) {
+			pulled_first_chunk = true;
 			current_chunk = DuckDBNative.duckdb_jdbc_fetch(result_ref);
 			chunk_idx = 1;
 		}

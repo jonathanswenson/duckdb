@@ -120,4 +120,8 @@ public class DuckDBNative {
 	protected static native void duckdb_jdbc_appender_append_null(ByteBuffer appender_ref) throws SQLException;
 
 	protected static native void duckdb_jdbc_ingest_arrow_table(ByteBuffer conn_ref, byte[] schema_name, byte[] table_name, DuckDBArrayStreamWrapper array_stream_wrapper) throws SQLException;
+
+	// TODO this returns an arrow reader (given an appropriate implementation) but currently this doesn't load the arrow
+	//  c java bindings as a dependency
+	protected static native Object duckdb_jdbc_export_arrow_array_stream(ByteBuffer res_ref, DuckDBArrayStreamImporter importer);
 }
