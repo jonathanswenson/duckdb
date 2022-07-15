@@ -1,5 +1,7 @@
 package org.duckdb.test;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.math.BigInteger;
@@ -20,21 +22,46 @@ import java.sql.Statement;
 import java.sql.Time;
 import java.sql.Timestamp;
 import java.sql.Types;
-import java.sql.SQLWarning;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Properties;
 import java.util.TimeZone;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 import org.duckdb.DuckDBAppender;
+import org.duckdb.DuckDBArrayStreamImporter;
+import org.duckdb.DuckDBArrayStreamWrapper;
 import org.duckdb.DuckDBConnection;
 import org.duckdb.DuckDBDatabase;
 import org.duckdb.DuckDBDriver;
+import org.duckdb.DuckDBResultSet;
 import org.duckdb.DuckDBTimestamp;
 import org.duckdb.DuckDBColumnType;
 import org.duckdb.DuckDBResultSetMetaData;
+
+import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.ArrowSchema;
+import org.apache.arrow.c.Data;
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import org.apache.arrow.vector.types.FloatingPointPrecision;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.arrow.vector.util.Text;
+import org.apache.arrow.vector.*;
 
 public class TestDuckDBJDBC {
 
@@ -2186,13 +2213,651 @@ public class TestDuckDBJDBC {
 		}
 	}
 
+	private static DuckDBArrayStreamWrapper wrapStream(ArrowReader passedReader, BufferAllocator passedAllocator) throws Exception {
+		final ArrowReader arrowReader = passedReader;
+		final BufferAllocator allocator = passedAllocator;
+		final Schema schema = arrowReader.getVectorSchemaRoot().getSchema();
+
+		return new DuckDBArrayStreamWrapper() {
+			@Override
+			public void exportArrayStream(long arrowArrayStreamPointer) {
+				ArrowArrayStream arrowArrayStream = ArrowArrayStream.wrap(arrowArrayStreamPointer);
+				Data.exportArrayStream(allocator, arrowReader, arrowArrayStream);
+			}
+
+			@Override
+			public void exportSchema(long arrowSchemaPointer) {
+				ArrowSchema arrowSchema = ArrowSchema.wrap(arrowSchemaPointer);
+				Data.exportSchema(allocator, schema, null, arrowSchema);
+			}
+		};
+	}
+
+	private static DuckDBArrayStreamImporter makeImporter(BufferAllocator passedAllocator) throws Exception {
+		final BufferAllocator allocator = passedAllocator;
+		return new DuckDBArrayStreamImporter() {
+			public Object importArrayStream(long arrowArrayStreamPointer) {
+				ArrowArrayStream stream = ArrowArrayStream.wrap(arrowArrayStreamPointer);
+				return Data.importArrayStream(allocator, stream);
+			}
+		};
+	}
+
+	private static ArrowReader arrowReaderFromSchemaRoot(VectorSchemaRoot vsr, BufferAllocator allocator) throws Exception {
+		ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
+		try (ArrowStreamWriter writer = new ArrowStreamWriter(vsr, null, byteArrayOutputStream)) {
+			writer.writeBatch();
+			writer.end();
+		}
+
+		ByteArrayInputStream byteArrayInputStream = new ByteArrayInputStream(byteArrayOutputStream.toByteArray());
+		return new ArrowStreamReader(byteArrayInputStream, allocator);
+	}
+
+	private static <U> List<U> firstColumnValuesArrow(DuckDBConnection connection, BufferAllocator allocator) throws Exception {
+		return firstColumnValuesArrow(connection, allocator, "select value from new_table");
+	}
+
+	private static <U> List<U> firstColumnValuesArrow(DuckDBConnection connection, BufferAllocator allocator, String query) throws Exception {
+		Statement stmt = connection.createStatement();
+		DuckDBResultSet resultSet = (DuckDBResultSet)stmt.executeQuery(query);
+		ArrowReader returnedReader = (ArrowReader) resultSet.arrowExportArrayStream(makeImporter(allocator));
+		VectorSchemaRoot returnedVsr = returnedReader.getVectorSchemaRoot();
+		ArrayList<U> list = new ArrayList<>();
+		while(returnedReader.loadNextBatch()) {
+			for (int i = 0; i < returnedVsr.getRowCount(); i++) {
+				@SuppressWarnings("unchecked")
+				U value = (U) returnedVsr.getVector(0).getObject(i);
+				list.add(value);
+			}
+		}
+		return list;
+	}
+
+	private static <U> List<U> firstColumnValuesJdbc(DuckDBConnection connection) throws Exception {
+		Statement stmt = connection.createStatement();
+		DuckDBResultSet resultSet = (DuckDBResultSet)stmt.executeQuery("select value from new_table");
+		ArrayList<U> list = new ArrayList<>();
+		while(resultSet.next()) {
+			@SuppressWarnings("unchecked") //
+			U value = (U) resultSet.getObject(1);
+			list.add(value);
+		}
+		return list;
+	}
+
+	private static VectorSchemaRoot createVectorSchemaRoot(ArrowType arrowType, BufferAllocator allocator, int capacity, boolean nullable) {
+		FieldType fieldType = nullable ? FieldType.nullable(arrowType) : FieldType.notNullable(arrowType);
+		Field field = new Field("value", fieldType, new ArrayList<Field>());
+
+		ArrayList<Field> fields = new ArrayList<Field>();
+		fields.add(field);
+
+		Schema schema = new Schema(fields);
+		VectorSchemaRoot vsr = VectorSchemaRoot.create(schema, allocator);
+		vsr.setRowCount(capacity);
+		vsr.getVector(0).setInitialCapacity(capacity);
+		return vsr;
+	}
+
+	private static <T> void loadArrowDataIntoTable(
+		DuckDBConnection connection,
+		BufferAllocator allocator,
+		ArrowType arrowType,
+		List<T> roundtripValues,
+		Setter<T> setter
+	) throws Exception {
+		VectorSchemaRoot vsr = createVectorSchemaRoot(arrowType, allocator, roundtripValues.size(), true);
+		FieldVector vector = vsr.getVector(0);
+
+		for (int i = 0; i < roundtripValues.size(); i++) {
+			T toSet = roundtripValues.get(i);
+			if (toSet != null) {
+				setter.setNonNullable(vector, toSet, i);
+			}
+		}
+
+		ArrowReader reader = arrowReaderFromSchemaRoot(vsr, allocator);
+		DuckDBArrayStreamWrapper wrappedStream = wrapStream(reader, allocator);
+
+		connection.ingestArrowTable("main", "new_table", wrappedStream);
+	}
+
+	interface Setter<T> {
+		void setNonNullable(FieldVector fieldVector, T data, int index);
+	}
+
+	static class LongSetter implements Setter<Long> {
+		public void setNonNullable(FieldVector fieldVector, Long data, int index) {
+			if (fieldVector instanceof BigIntVector) {
+				((BigIntVector) fieldVector).set(index, data);
+			} else if (fieldVector instanceof UInt8Vector) {
+				((UInt8Vector) fieldVector).set(index, data);
+			}
+		}
+	}
+
+	static class IntSetter implements Setter<Integer> {
+		public void setNonNullable(FieldVector fieldVector, Integer data, int index) {
+			if (fieldVector instanceof IntVector) {
+				((IntVector) fieldVector).set(index, data);
+			} else if (fieldVector instanceof UInt4Vector) {
+				((UInt4Vector) fieldVector).set(index, data);
+			}
+		}
+	}
+
+	static class ShortSetter implements Setter<Short> {
+		public void setNonNullable(FieldVector fieldVector, Short data, int index) {
+			((SmallIntVector) fieldVector).set(index, data);
+		}
+	}
+
+	static class CharSetter implements Setter<Character> {
+		public void setNonNullable(FieldVector fieldVector, Character data, int index) {
+			((UInt2Vector) fieldVector).set(index, data);
+		}
+	}
+
+	static class ByteSetter implements Setter<Byte> {
+		public void setNonNullable(FieldVector fieldVector, Byte data, int index) {
+			((TinyIntVector) fieldVector).set(index, data);
+		}
+	}
+
+	private static <T> void verifySimpleRoundTrip(List<T> roundtripValues, Setter<T> setter, ArrowType arrowType) throws Exception {
+		DuckDBConnection conn = (DuckDBConnection) DriverManager.getConnection("jdbc:duckdb:");
+		BufferAllocator allocator = new RootAllocator();
+
+		loadArrowDataIntoTable(conn, allocator, arrowType, roundtripValues, setter);
+
+		verifyRoundTrip(roundtripValues, conn, allocator);
+	}
+
+	public static void test_arrow_int_ingestion() throws Exception {
+		ArrowType arrowType = new ArrowType.Int(32, true);
+		List<Integer> roundtripValues = Arrays.asList(1,2,3,5,8,13,21,-1,null);
+		verifySimpleRoundTrip(roundtripValues, new IntSetter(), arrowType);
+	}
+
+	public static void test_arrow_uint_ingestion() throws Exception {
+		ArrowType arrowType = new ArrowType.Int(32, false);
+		List<Integer> roundtripValues = Arrays.asList(
+			0,
+			Integer.parseUnsignedInt("4294967295"),
+			null
+		);
+
+		DuckDBConnection conn = (DuckDBConnection) DriverManager.getConnection("jdbc:duckdb:");
+		BufferAllocator allocator = new RootAllocator();
+
+		loadArrowDataIntoTable(conn, allocator, arrowType, roundtripValues, new IntSetter());
+
+		List<Long> jdbcValues = firstColumnValuesJdbc(conn);
+		List<Integer> arrowValues = firstColumnValuesArrow(conn, allocator);
+
+		for (int i = 0; i < roundtripValues.size(); i++) {
+			if (roundtripValues.get(i) == null) {
+				assertNull(jdbcValues.get(i));
+				assertNull(arrowValues.get(i));
+				continue;
+			}
+			assertEquals(roundtripValues.get(i), Integer.parseUnsignedInt(jdbcValues.get(i).toString()));
+			assertEquals(roundtripValues.get(i), arrowValues.get(i));
+		}
+	}
+
+	public static void test_arrow_tinyint_ingestion() throws Exception {
+		ArrowType arrowType = new ArrowType.Int(8, true);
+		List<Byte> roundtripValues = Arrays.asList(
+			Byte.valueOf("-128"),
+			Byte.valueOf("127"),
+			Byte.valueOf("0"),
+			null
+		);
+		verifySimpleRoundTrip(roundtripValues, new ByteSetter(), arrowType);
+	}
+
+	// TODO utinyint
+
+	public static void test_arrow_smallint_ingestion() throws Exception {
+		ArrowType arrowType = new ArrowType.Int(16, true);
+		List<Short> roundtripValues = Arrays.asList(
+			Short.parseShort("-32768"),
+			Short.parseShort("32767"),
+			Short.parseShort("0"),
+			null
+		);
+		verifySimpleRoundTrip(roundtripValues, new ShortSetter(), arrowType);
+	}
+
+	public static void test_arrow_usmallint_ingestion() throws Exception {
+		ArrowType arrowType = new ArrowType.Int(16, false);
+		List<Character> roundtripValues = Arrays.asList(Character.MIN_VALUE, Character.MAX_VALUE, null);
+
+		DuckDBConnection conn = (DuckDBConnection) DriverManager.getConnection("jdbc:duckdb:");
+		BufferAllocator allocator = new RootAllocator();
+
+		loadArrowDataIntoTable(conn, allocator, arrowType, roundtripValues, new CharSetter());
+
+		List<Integer> jdbcValues = firstColumnValuesJdbc(conn);
+		List<Character> arrowValues = firstColumnValuesArrow(conn, allocator);
+
+		for (int i = 0; i < roundtripValues.size(); i++) {
+			if (roundtripValues.get(i) == null) {
+				assertNull(jdbcValues.get(i));
+				assertNull(arrowValues.get(i));
+				continue;
+			}
+			assertEquals(roundtripValues.get(i), (char) jdbcValues.get(i).intValue());
+			assertEquals(roundtripValues.get(i), arrowValues.get(i));
+		}
+	}
+
+	public static void test_arrow_bigint_ingestion() throws Exception {
+		ArrowType arrowType = new ArrowType.Int(64, true);
+		List<Long> roundtripValues = Arrays.asList(-9223372036854775808L, 9223372036854775807L, 0L, null);
+		verifySimpleRoundTrip(roundtripValues, new LongSetter(), arrowType);
+	}
+
+	public static void test_arrow_ubigint_ingestion() throws Exception {
+		ArrowType arrowType = new ArrowType.Int(64, false);
+		List<Long> roundtripValues = Arrays.asList(
+			Long.parseUnsignedLong("0"),
+			Long.parseUnsignedLong("18446744073709551615"),
+			null
+		);
+
+		DuckDBConnection conn = (DuckDBConnection) DriverManager.getConnection("jdbc:duckdb:");
+		BufferAllocator allocator = new RootAllocator();
+
+		loadArrowDataIntoTable(conn, allocator, arrowType, roundtripValues, new LongSetter());
+
+		List<BigInteger> jdbcValues = firstColumnValuesJdbc(conn);
+		List<Long> arrowValues = firstColumnValuesArrow(conn, allocator);
+
+		for (int i = 0; i < roundtripValues.size(); i++) {
+			if (roundtripValues.get(i) == null) {
+				assertNull(jdbcValues.get(i));
+				assertNull(arrowValues.get(i));
+				continue;
+			}
+			assertEquals(roundtripValues.get(i), Long.parseUnsignedLong(jdbcValues.get(i).toString()));
+			assertEquals(roundtripValues.get(i), arrowValues.get(i));
+		}
+	}
+
+	public static void test_arrow_hugeint_extraction() throws Exception {
+		DuckDBConnection conn = (DuckDBConnection) DriverManager.getConnection("jdbc:duckdb:");
+		BufferAllocator allocator = new RootAllocator();
+		String min = "-170141183460469231731687303715884105727";
+		String max = "170141183460469231731687303715884105727";
+		String select = "SELECT CAST(" + max + " as HUGEINT) UNION SELECT CAST(" +  min + " as HUGEINT)";
+		List<BigDecimal> expected = Arrays.asList(new BigDecimal(max), new BigDecimal(min));
+		List<BigDecimal> arrowValues = firstColumnValuesArrow(conn, allocator, select);
+
+		for (int i = 0; i < expected.size(); i++) {
+			assertEquals(expected.get(i), arrowValues.get(i));
+		}
+	}
+
+	public static void test_arrow_uuid_extraction() throws Exception {
+		DuckDBConnection conn = (DuckDBConnection) DriverManager.getConnection("jdbc:duckdb:");
+		BufferAllocator allocator = new RootAllocator();
+
+		String min = "00000000-0000-0000-0000-000000000001";
+		String max = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+		String select = "SELECT CAST('" + max + "' AS UUID) UNION SELECT CAST('" +  min + "' AS UUID)";
+
+		List<UUID> expected = Arrays.asList(UUID.fromString(max), UUID.fromString(min));
+		List<Text> arrowValues = firstColumnValuesArrow(conn, allocator, select);
+
+		for (int i = 0; i < expected.size(); i++) {
+			assertEquals(expected.get(i).toString(), arrowValues.get(i).toString());
+		}
+	}
+
+	static class FloatSetter implements Setter<Float> {
+		public void setNonNullable(FieldVector fieldVector, Float data, int index) {
+			((Float4Vector) fieldVector).set(index, data);
+		}
+	}
+
+	static class DoubleSetter implements Setter<Double> {
+		public void setNonNullable(FieldVector fieldVector, Double data, int index) {
+			((Float8Vector) fieldVector).set(index, data);
+		}
+	}
+
+	public static void test_arrow_float_ingestion() throws Exception {
+		ArrowType arrowType = new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE);
+		List<Float> roundtripValues = Arrays.asList(
+			-3.4028234663852886e+38F,
+			3.4028234663852886e+38F,
+			Float.NaN,
+			Float.NEGATIVE_INFINITY,
+			Float.POSITIVE_INFINITY,
+			null
+		);
+		verifySimpleRoundTrip(roundtripValues, new FloatSetter(), arrowType);
+	}
+
+	public static void test_arrow_double_ingestion() throws Exception {
+		ArrowType arrowType = new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE);
+		List<Double> roundtripValues = Arrays.asList(
+			-1.7976931348623157e+308,
+			1.7976931348623157e+308,
+			Double.NaN,
+			Double.NEGATIVE_INFINITY,
+			Double.POSITIVE_INFINITY,
+			null
+		);
+		verifySimpleRoundTrip(roundtripValues, new DoubleSetter(), arrowType);
+	}
+
+	public static void test_arrow_boolean_ingestion() throws Exception {
+		ArrowType arrowType = new ArrowType.Bool();
+		List<Boolean> roundtripValues = Arrays.asList(Boolean.TRUE, Boolean.FALSE, null);
+		verifySimpleRoundTrip(roundtripValues, new BooleanSetter(), arrowType);
+	}
+
+	static class BooleanSetter implements Setter<Boolean> {
+		public void setNonNullable(FieldVector fieldVector, Boolean data, int index) {
+			((BitVector) fieldVector).set(index, data ? 1 : 0);
+		}
+	}
+
+	private static <T> void verifyRoundTrip(List<T> roundtripValues, DuckDBConnection conn, BufferAllocator allocator) throws Exception {
+		List<T> jdbcValues = firstColumnValuesJdbc(conn);
+		List<T> arrowValues = firstColumnValuesArrow(conn, allocator);
+
+		for (int i = 0; i < roundtripValues.size(); i++) {
+			assertEquals(roundtripValues.get(i), jdbcValues.get(i));
+			assertEquals(roundtripValues.get(i), arrowValues.get(i));
+		}
+	}
+
+	static class StringSetter implements Setter<String> {
+		public void setNonNullable(FieldVector fieldVector, String data, int index) {
+			((VarCharVector) fieldVector).setSafe(index, data.getBytes(StandardCharsets.UTF_8));
+		}
+	}
+
+	public static void test_arrow_string_ingestion() throws Exception {
+		ArrowType arrowType = new ArrowType.Utf8();
+		List<String> roundtripValues = Arrays.asList("䭔\uD86D\uDF7C🔥\uD83D\uDE1C🏳️‍🌈", "🦆🦆🦆🦆🦆🦆🦆🦆", "hello, world!", null);
+		DuckDBConnection conn = (DuckDBConnection) DriverManager.getConnection("jdbc:duckdb:");
+		BufferAllocator allocator = new RootAllocator();
+		loadArrowDataIntoTable(conn, allocator, arrowType, roundtripValues, new StringSetter());
+
+		List<String> jdbcValues = firstColumnValuesJdbc(conn);
+		List<Text> arrowValues = firstColumnValuesArrow(conn, allocator);
+		for (int i = 0; i < roundtripValues.size(); i++) {
+			assertEquals(roundtripValues.get(i), jdbcValues.get(i));
+			Text arrowCompareValue = arrowValues.get(i);
+			assertEquals(roundtripValues.get(i), arrowCompareValue == null ? null : arrowCompareValue.toString());
+		}
+	}
+
+	static class BigDecimalSetter implements Setter<BigDecimal> {
+		public void setNonNullable(FieldVector fieldVector, BigDecimal data, int index) {
+			((DecimalVector) fieldVector).set(index, data);
+		}
+	}
+
+	public static void test_arrow_bigdecimal_4_1_ingestion() throws Exception {
+		ArrowType arrowType = new ArrowType.Decimal(4, 1, 128);
+		List<BigDecimal> roundtripValues = Arrays.asList(
+			BigDecimal.valueOf(-9999, 1),
+			BigDecimal.valueOf(9999, 1),
+			null
+		);
+		verifySimpleRoundTrip(roundtripValues, new BigDecimalSetter(), arrowType);
+	}
+
+	public static void test_arrow_bigdecimal_9_4_ingestion() throws Exception {
+		ArrowType arrowType = new ArrowType.Decimal(9, 4, 128);
+		List<BigDecimal> roundtripValues = Arrays.asList(
+			BigDecimal.valueOf(-999999999, 4),
+			BigDecimal.valueOf(999999999L, 4),
+			null
+		);
+		verifySimpleRoundTrip(roundtripValues, new BigDecimalSetter(), arrowType);
+	}
+
+	public static void test_arrow_bigdecimal_18_6_ingestion() throws Exception {
+		ArrowType arrowType = new ArrowType.Decimal(18, 6, 128);
+		List<BigDecimal> roundtripValues = Arrays.asList(
+			BigDecimal.valueOf(-999999999999999999L, 6),
+			BigDecimal.valueOf(999999999999999999L, 6),
+			null
+		);
+		verifySimpleRoundTrip(roundtripValues, new BigDecimalSetter(), arrowType);
+	}
+
+	public static void test_arrow_bigdecimal_38_10_ingestion() throws Exception {
+		ArrowType arrowType = new ArrowType.Decimal(38, 10, 128);
+		List<BigDecimal> roundtripValues = Arrays.asList(
+			new BigDecimal("-9999999999999999999999999999.9999999999"),
+			new BigDecimal("9999999999999999999999999999.9999999999"),
+			null
+		);
+		verifySimpleRoundTrip(roundtripValues, new BigDecimalSetter(), arrowType);
+	}
+
+	public static void test_arrow_bigdecimal_38_0_ingestion() throws Exception {
+		ArrowType arrowType = new ArrowType.Decimal(38, 0, 128);
+		List<BigDecimal> roundtripValues = Arrays.asList(
+			new BigDecimal("-99999999999999999999999999999999999999"),
+			new BigDecimal("99999999999999999999999999999999999999"),
+			null
+		);
+		verifySimpleRoundTrip(roundtripValues, new BigDecimalSetter(), arrowType);
+	}
+
+	static class TimestampSetter implements Setter<Long> {
+		public void setNonNullable(FieldVector fieldVector, Long data, int index) {
+			((TimeStampVector) fieldVector).set(index, data);
+		}
+	}
+
+	private static void verifyRoundTripTimestamps(ArrowType arrowType, List<Long> roundtripValues, TimeUnit timeUnit) throws Exception {
+		String originalTzProperty = System.getProperty("user.timezone");
+		TimeZone originalTz = TimeZone.getDefault();
+		try {
+			TimeZone.setDefault(TimeZone.getTimeZone("UTC"));
+			System.setProperty("user.timezone", "UTC");
+
+			DuckDBConnection conn = (DuckDBConnection) DriverManager.getConnection("jdbc:duckdb:");
+			BufferAllocator allocator = new RootAllocator();
+
+			loadArrowDataIntoTable(conn, allocator, arrowType, roundtripValues, new TimestampSetter());
+
+			List<Timestamp> jdbcValues = firstColumnValuesJdbc(conn);
+			List<LocalDateTime> arrowValues = firstColumnValuesArrow(conn, allocator);
+
+			for (int i = 0; i < roundtripValues.size(); i++) {
+				Long roundTripValue = roundtripValues.get(i);
+				Timestamp equivalent;
+				if (roundTripValue == null) {
+					equivalent = null;
+				} else {
+					long totalNanos = timeUnit.toNanos(roundTripValue);
+					long timeSeconds = TimeUnit.NANOSECONDS.toSeconds(totalNanos);
+					long timeNanos = TimeUnit.SECONDS.toNanos(timeSeconds);
+
+					long nanoRemainder = (totalNanos - timeNanos);
+					long timeMillis = TimeUnit.SECONDS.toMillis(timeSeconds);
+					equivalent = new Timestamp(timeMillis);
+					equivalent.setNanos((int) nanoRemainder);
+				}
+
+				LocalDateTime arrowRawValue = arrowValues.get(i);
+				Timestamp arrowTimestampValue = arrowRawValue == null ? null : Timestamp.valueOf(arrowRawValue);
+
+				assertEquals(equivalent, jdbcValues.get(i));
+				assertEquals(equivalent, arrowTimestampValue);
+			}
+		} finally {
+			TimeZone.setDefault(originalTz);
+			System.setProperty("user.timezone", originalTzProperty);
+		}
+	}
+
+	public static void test_arrow_timestamp_micros_insertion() throws Exception {
+		ArrowType arrowType = new ArrowType.Timestamp(org.apache.arrow.vector.types.TimeUnit.MICROSECOND, null);
+
+		Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+		long micros = TimeUnit.SECONDS.toMicros(now.getEpochSecond()) + TimeUnit.NANOSECONDS.toMicros(now.getNano());
+
+		List<Long> longs = Arrays.asList(micros, null);
+
+		verifyRoundTripTimestamps(arrowType, longs, TimeUnit.MICROSECONDS);
+	}
+
+	public static void test_arrow_timestamp_millis_insertion() throws Exception {
+		ArrowType arrowType = new ArrowType.Timestamp(org.apache.arrow.vector.types.TimeUnit.MILLISECOND, null);
+
+		Instant now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+		long millis = now.toEpochMilli();
+
+		List<Long> longs = Arrays.asList(millis, null);
+
+		verifyRoundTripTimestamps(arrowType, longs, TimeUnit.MILLISECONDS);
+	}
+
+	public static void test_arrow_timestamp_seconds_insertion() throws Exception {
+		ArrowType arrowType = new ArrowType.Timestamp(org.apache.arrow.vector.types.TimeUnit.SECOND, null);
+
+		Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+		long seconds = now.getEpochSecond();
+
+		List<Long> longs = Arrays.asList(seconds, null);
+
+		verifyRoundTripTimestamps(arrowType, longs, TimeUnit.SECONDS);
+	}
+
+	public static void test_arrow_timestamp_nanos_insertion() throws Exception {
+		ArrowType arrowType = new ArrowType.Timestamp(org.apache.arrow.vector.types.TimeUnit.NANOSECOND, null);
+
+		Instant now = Instant.now().truncatedTo(ChronoUnit.NANOS);
+		long nanos = TimeUnit.SECONDS.toNanos(now.getEpochSecond()) + now.getNano();
+
+		List<Long> longs = Arrays.asList(nanos, null);
+
+		verifyRoundTripTimestamps(arrowType, longs, TimeUnit.NANOSECONDS);
+	}
+
+	// List<Byte> because generics and arrays are not friends
+	static class BinarySetter implements Setter<byte[]> {
+		ArrowType arrowType;
+
+		BinarySetter(ArrowType arrowType) {
+			this.arrowType = arrowType;
+		}
+
+		@Override
+		public void setNonNullable(FieldVector fieldVector, byte[] data, int index) {
+			switch (arrowType.getTypeID()) {
+				case LargeBinary:
+					((LargeVarBinaryVector) fieldVector).setSafe(index, data);
+					break;
+				case Binary:
+					((VarBinaryVector) fieldVector).setSafe(index, data);
+					break;
+				case FixedSizeBinary:
+					((FixedSizeBinaryVector) fieldVector).setSafe(index, data);
+					break;
+				default:
+					throw new IllegalArgumentException("unsupported type");
+
+			}
+		}
+	}
+
+	public static void test_arrow_binary_types_ingestion() throws Exception {
+		ArrowType binaryType = new ArrowType.Binary();
+		List<byte[]> roundtripValues = Arrays.asList(
+			"Duckdb!".getBytes(StandardCharsets.UTF_8),
+			null
+		);
+		DuckDBConnection conn = (DuckDBConnection) DriverManager.getConnection("jdbc:duckdb:");
+		BufferAllocator allocator = new RootAllocator();
+
+		loadArrowDataIntoTable(conn, allocator, binaryType, roundtripValues, new BinarySetter(binaryType));
+
+		// TODO jdbc implementation when Blob is implemented.
+		List<byte[]> arrowValues = firstColumnValuesArrow(conn, allocator);
+		for (int i = 0; i < roundtripValues.size(); i++) {
+			assertByteArrayEquals(roundtripValues.get(i), arrowValues.get(i));
+		}
+	}
+
+	public static void test_arrow_large_binary_types_ingestion() throws Exception {
+		ArrowType binaryType = new ArrowType.LargeBinary();
+		List<byte[]> roundtripValues = Arrays.asList(
+			"Duckdb... but bigger!".getBytes(StandardCharsets.UTF_8),
+			null
+		);
+		DuckDBConnection conn = (DuckDBConnection) DriverManager.getConnection("jdbc:duckdb:");
+		BufferAllocator allocator = new RootAllocator();
+
+		loadArrowDataIntoTable(conn, allocator, binaryType, roundtripValues, new BinarySetter(binaryType));
+
+		// TODO jdbc implementation when Blob is implemented.
+		List<byte[]> arrowValues = firstColumnValuesArrow(conn, allocator);
+		for (int i = 0; i < roundtripValues.size(); i++) {
+			assertByteArrayEquals(roundtripValues.get(i), arrowValues.get(i));
+		}
+	}
+
+	public static void test_arrow_fixed_sized_binary_types_ingestion() throws Exception {
+		ArrowType binaryType = new ArrowType.FixedSizeBinary(10);
+		List<byte[]> roundtripValues = Arrays.asList(
+			"0123456789".getBytes(StandardCharsets.UTF_8),
+			null
+		);
+		DuckDBConnection conn = (DuckDBConnection) DriverManager.getConnection("jdbc:duckdb:");
+		BufferAllocator allocator = new RootAllocator();
+
+		loadArrowDataIntoTable(conn, allocator, binaryType, roundtripValues, new BinarySetter(binaryType));
+
+		// TODO jdbc implementation when Blob is implemented.
+		List<byte[]> arrowValues = firstColumnValuesArrow(conn, allocator);
+		for (int i = 0; i < roundtripValues.size(); i++) {
+			assertByteArrayEquals(roundtripValues.get(i), arrowValues.get(i));
+		}
+	}
+
+	public static void assertByteArrayEquals(byte[] expected, byte[] actual) throws Exception {
+		if (expected == null) {
+			assertNull(actual);
+			return;
+		} else if (actual == null) {
+			fail();
+		}
+
+		assertEquals(expected.length, actual.length);
+		for (int i = 0; i < expected.length; i++) {
+			assertEquals(expected[i], actual[i]);
+		}
+	}
 
 	public static void main(String[] args) throws Exception {
+		String match = null;
+		if (args.length >= 1) {
+			match = args[0];
+			System.out.println("running any test that contains: " + args[0]);
+		}
 		// Woo I can do reflection too, take this, JUnit!
 		Method[] methods = TestDuckDBJDBC.class.getMethods();
 		boolean anyFailed = false;
 		for (Method m : methods) {
-			if (m.getName().startsWith("test_")) {
+			String methodName = m.getName();
+			if (methodName.startsWith("test_")) {
+				if (match != null && !methodName.contains(match)) {
+					continue;
+				}
 				System.out.print(m.getName() + " ");
 
 				LocalDateTime start = LocalDateTime.now();

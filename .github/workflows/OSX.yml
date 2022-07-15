@@ -93,7 +93,7 @@ jobs:
       shell: bash
       run: |
         python tools/shell/shell-test.py build/release/duckdb
-        java -cp build/release/tools/jdbc/duckdb_jdbc.jar org.duckdb.test.TestDuckDBJDBC
+        build/release/test_jdbc.sh
 
     - name: Examples
       shell: bash

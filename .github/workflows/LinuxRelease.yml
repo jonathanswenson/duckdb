@@ -61,7 +61,7 @@ jobs:
       run: |
         python3.7 tools/shell/shell-test.py build/release/duckdb
         python3.7 tools/rest/test_the_rest.py build/release/tools/rest
-        java -cp build/release/tools/jdbc/duckdb_jdbc.jar org.duckdb.test.TestDuckDBJDBC
+        build/release/test_jdbc.sh
 
     - name: Examples
       shell: bash
